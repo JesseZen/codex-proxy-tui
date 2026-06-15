@@ -296,7 +296,9 @@ test("restores config on shutdown", async (t) => {
 
   const patchedText = await readFile(configPath, "utf8");
   assert.match(patchedText, new RegExp(`base_url = "http://127\\.0\\.0\\.1:${proxyPort}"`));
-  assert.match(patchedText, /experimental_bearer_token = "test-upstream-key"/);
+  // experimental_bearer_token is no longer patched — the proxy injects
+  // the upstream API key on every outgoing request instead.
+  assert.match(patchedText, /experimental_bearer_token = "orig-token"/);
 
   await proxy.stop();
 

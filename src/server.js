@@ -224,14 +224,9 @@ function getStartupConfigPatchPlan() {
     });
   }
 
-  if (UPSTREAM_API_KEY) {
-    plan.push({
-      action: "set",
-      fieldName: "experimental_bearer_token",
-      nextValue: UPSTREAM_API_KEY,
-      reason: "override the upstream bearer token",
-    });
-  }
+  // Skip patching experimental_bearer_token — the proxy injects the
+  // upstream API key on every outgoing request regardless, so there
+  // is no need to write it into the Codex config file.
 
   return plan;
 }
