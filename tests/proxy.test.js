@@ -913,3 +913,211 @@ test("chat_completions mode: buildInitialResponse includes extra fields", async 
   assert.equal(created.data.response.incomplete_details, null);
   assert.equal(created.data.response.previous_response_id, null);
 });
+
+// ---------------------------------------------------------------------------
+// Hot-swap provider tests
+// ---------------------------------------------------------------------------
+
+test("/_proxy/status returns current provider config", async (t) => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "codex-proxy-test-"));
+  const upstream = await startMockUpstream();
+  const configPath = await createTempConfig(tempDir);
+  const proxyPort = 21030;
+  const proxy = await startProxy({
+    baseUrl: upstream.url,
+    configPath,
+    port: proxyPort,
+  });
+
+  t.after(async () => {
+    await proxy.stop();
+    await upstream.close();
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  const response = await fetch(`http://127.0.0.1:${proxyPort}/_proxy/status`);
+  assert.equal(response.status, 200);
+
+  const status = await response.json();
+  assert.equal(status.baseUrl, upstream.url);
+  assert.equal(status.hasApiKey, true); // we set API_KEY in startProxy
+  assert.equal(status.apiFormat, "");
+  assert.equal(status.modelNameOverride, "");
+});
+
+test("/_proxy/switch hot-swaps provider at runtime", async (t) => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "codex-proxy-test-"));
+
+  // Create two mock upstreams — each will track its own requests
+  const upstreamA = await startMockUpstream();
+  const upstreamB = await startMockUpstream();
+
+  const configPath = await createTempConfig(tempDir);
+
+  // Create .env.providerA and .env.providerB files in project root
+  const envAPath = path.resolve(process.cwd(), ".env.providerA");
+  const envBPath = path.resolve(process.cwd(), ".env.providerB");
+
+  await writeFile(envAPath, `BASE_URL=${upstreamA.url}\nAPI_KEY=key-a\n`, "utf8");
+  await writeFile(envBPath, `BASE_URL=${upstreamB.url}\nAPI_KEY=key-b\nAPI_FORMAT=chat_completions\n`, "utf8");
+
+  t.after(async () => {
+    await rm(envAPath, { force: true });
+    await rm(envBPath, { force: true });
+  });
+
+  // Start proxy with providerA
+  const proxyPort = 21031;
+  const proxy = await startProxy({
+    baseUrl: upstreamA.url,
+    configPath,
+    port: proxyPort,
+    extraEnv: { ACTIVE_PROVIDER: "providerA", API_KEY: "key-a" },
+  });
+
+  t.after(async () => {
+    await proxy.stop();
+    await upstreamA.close();
+    await upstreamB.close();
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  // Verify initial request goes to upstream A
+  const responseA = await fetch(`http://127.0.0.1:${proxyPort}/v1/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ input: "hello-A" }),
+  });
+  assert.equal(responseA.status, 200);
+  assert.equal(upstreamA.requests.length, 1);
+  assert.equal(upstreamB.requests.length, 0);
+  assert.equal(upstreamA.requests[0].headers.authorization, "Bearer key-a");
+
+  // Hot-swap to providerB
+  const switchResponse = await fetch(`http://127.0.0.1:${proxyPort}/_proxy/switch`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ provider: "providerB" }),
+  });
+  assert.equal(switchResponse.status, 200);
+
+  const switchResult = await switchResponse.json();
+  assert.equal(switchResult.previous.baseUrl, upstreamA.url);
+  assert.equal(switchResult.previous.apiKey, "key-a");
+  assert.equal(switchResult.current.baseUrl, upstreamB.url);
+  assert.equal(switchResult.current.apiKey, "key-b");
+  assert.equal(switchResult.current.apiFormat, "chat_completions");
+
+  // Verify next request goes to upstream B
+  const responseB = await fetch(`http://127.0.0.1:${proxyPort}/v1/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ input: "hello-B" }),
+  });
+  assert.equal(responseB.status, 200);
+  // A should still have 1 request, B should now have 1
+  assert.equal(upstreamA.requests.length, 1);
+  assert.equal(upstreamB.requests.length, 1);
+  assert.equal(upstreamB.requests[0].headers.authorization, "Bearer key-b");
+
+  // Verify status endpoint reflects new provider
+  const statusResponse = await fetch(`http://127.0.0.1:${proxyPort}/_proxy/status`);
+  assert.equal(statusResponse.status, 200);
+  const status = await statusResponse.json();
+  assert.equal(status.activeProvider, "providerB");
+  assert.equal(status.baseUrl, upstreamB.url);
+  assert.equal(status.hasApiKey, true);
+  assert.equal(status.apiFormat, "chat_completions");
+});
+
+test("/_proxy/switch with invalid provider name returns 400", async (t) => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "codex-proxy-test-"));
+  const upstream = await startMockUpstream();
+  const configPath = await createTempConfig(tempDir);
+  const proxyPort = 21032;
+  const proxy = await startProxy({
+    baseUrl: upstream.url,
+    configPath,
+    port: proxyPort,
+  });
+
+  t.after(async () => {
+    await proxy.stop();
+    await upstream.close();
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  // Missing provider field
+  const response1 = await fetch(`http://127.0.0.1:${proxyPort}/_proxy/switch`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(response1.status, 400);
+
+  // Empty provider name
+  const response2 = await fetch(`http://127.0.0.1:${proxyPort}/_proxy/switch`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ provider: "" }),
+  });
+  assert.equal(response2.status, 400);
+
+  // Provider with invalid characters
+  const response3 = await fetch(`http://127.0.0.1:${proxyPort}/_proxy/switch`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ provider: "has spaces" }),
+  });
+  assert.equal(response3.status, 400);
+});
+
+test("/_proxy/switch with nonexistent .env file returns 400", async (t) => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "codex-proxy-test-"));
+  const upstream = await startMockUpstream();
+  const configPath = await createTempConfig(tempDir);
+  const proxyPort = 21033;
+  const proxy = await startProxy({
+    baseUrl: upstream.url,
+    configPath,
+    port: proxyPort,
+  });
+
+  t.after(async () => {
+    await proxy.stop();
+    await upstream.close();
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  // .env.nonexistent doesn't exist, so it has no BASE_URL
+  const response = await fetch(`http://127.0.0.1:${proxyPort}/_proxy/switch`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ provider: "nonexistent" }),
+  });
+  assert.equal(response.status, 400);
+
+  const body = await response.json();
+  assert.ok(body.error.message.includes("BASE_URL"));
+});
+
+test("/_proxy/ unknown management endpoint returns 404", async (t) => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "codex-proxy-test-"));
+  const upstream = await startMockUpstream();
+  const configPath = await createTempConfig(tempDir);
+  const proxyPort = 21034;
+  const proxy = await startProxy({
+    baseUrl: upstream.url,
+    configPath,
+    port: proxyPort,
+  });
+
+  t.after(async () => {
+    await proxy.stop();
+    await upstream.close();
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  const response = await fetch(`http://127.0.0.1:${proxyPort}/_proxy/unknown`);
+  assert.equal(response.status, 404);
+});

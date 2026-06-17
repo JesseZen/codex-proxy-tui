@@ -14,15 +14,25 @@ loadDotEnv();
 
 const LISTEN_HOST = "127.0.0.1";
 const LISTEN_PORT = Number(process.env.PORT || "8787");
-const ACTIVE_PROVIDER = process.env.ACTIVE_PROVIDER || "";
-const UPSTREAM_BASE_URL = process.env.BASE_URL;
-const UPSTREAM_API_KEY = process.env.API_KEY || "";
 const CODEX_CONFIG_PATH = expandHome(process.env.CODEX_CONFIG_PATH || "~/.codex/config.toml");
 const LOCAL_BASE_URL = `http://${LISTEN_HOST}:${LISTEN_PORT}`;
 const LOG_EVERY_REQUEST = process.env.LOG_EVERY_REQUEST === "1";
 const LOG_FILTERED_REQUESTS = process.env.LOG_FILTERED_REQUESTS !== "0";
-const API_FORMAT = process.env.API_FORMAT || "";
-const MODEL_NAME_OVERRIDE = process.env.MODEL_NAME || "";
+
+// Mutable provider configuration — can be hot-swapped at runtime
+// via the /_proxy/switch endpoint without restarting the server.
+const providerConfig = {
+  activeProvider: process.env.ACTIVE_PROVIDER || "",
+  baseUrl: process.env.BASE_URL || "",
+  apiKey: process.env.API_KEY || "",
+  apiFormat: process.env.API_FORMAT || "",
+  modelNameOverride: process.env.MODEL_NAME || "",
+};
+
+if (!providerConfig.baseUrl) {
+  console.error("Missing BASE_URL");
+  process.exit(1);
+}
 
 const configPatchState = {
   patched: false,
@@ -30,11 +40,6 @@ const configPatchState = {
   providerName: null,
   entries: [],
 };
-
-if (!UPSTREAM_BASE_URL) {
-  console.error("Missing BASE_URL");
-  process.exit(1);
-}
 
 function loadDotEnv() {
   const initialEnvKeys = new Set(Object.keys(process.env));
@@ -215,7 +220,7 @@ function removeProviderFieldInConfig(configText, providerName, fieldName) {
 function getStartupConfigPatchPlan() {
   const plan = [];
 
-  if (UPSTREAM_BASE_URL) {
+  if (providerConfig.baseUrl) {
     plan.push({
       action: "set",
       fieldName: "base_url",
@@ -507,7 +512,7 @@ function convertResponsesContentToChat(content, role) {
 const CHAT_COMPLETIONS_API_FORMAT = "chat_completions";
 
 function isChatCompletionsMode() {
-  return API_FORMAT === CHAT_COMPLETIONS_API_FORMAT;
+  return providerConfig.apiFormat === CHAT_COMPLETIONS_API_FORMAT;
 }
 
 /**
@@ -623,7 +628,7 @@ function translateResponsesRequestToChatCompletions(body) {
   }
 
   const chatBody = {
-    model: MODEL_NAME_OVERRIDE || body.model,
+    model: providerConfig.modelNameOverride || body.model,
     messages,
     stream: body.stream !== false, // default to true for Codex App compatibility
   };
@@ -660,7 +665,7 @@ function buildInitialResponse(requestBody) {
     created_at: Math.floor(Date.now() / 1000),
     status: "in_progress",
     incomplete_details: null,
-    model: MODEL_NAME_OVERRIDE || requestBody?.model || "unknown",
+    model: providerConfig.modelNameOverride || requestBody?.model || "unknown",
     instructions: requestBody?.instructions || null,
     output: [],
     parallel_tool_calls: true,
@@ -1797,8 +1802,8 @@ function copyHeaders(
     headers.set(key, value);
   }
 
-  if (UPSTREAM_API_KEY) {
-    headers.set("authorization", `Bearer ${UPSTREAM_API_KEY}`);
+  if (providerConfig.apiKey) {
+    headers.set("authorization", `Bearer ${providerConfig.apiKey}`);
   }
 
   if (typeof bodyBufferLength === "number") {
@@ -1909,6 +1914,115 @@ function shouldLogRequest(removedCount) {
   return (removedCount > 0 && LOG_FILTERED_REQUESTS) || LOG_EVERY_REQUEST;
 }
 
+// ---------------------------------------------------------------------------
+// Hot-swap provider management
+// ---------------------------------------------------------------------------
+
+function switchProvider(newProviderName) {
+  const providerName = normalizeProviderName(newProviderName);
+
+  if (!providerName) {
+    throw new Error("provider name must not be empty");
+  }
+
+  const providerEnv = parseEnvFile(path.resolve(process.cwd(), `.env.${providerName}`));
+
+  const newBaseUrl = providerEnv.BASE_URL || "";
+  if (!newBaseUrl) {
+    throw new Error(`.env.${providerName} has no BASE_URL`);
+  }
+
+  const previous = {
+    activeProvider: providerConfig.activeProvider,
+    baseUrl: providerConfig.baseUrl,
+    apiKey: providerConfig.apiKey,
+    apiFormat: providerConfig.apiFormat,
+    modelNameOverride: providerConfig.modelNameOverride,
+  };
+
+  providerConfig.activeProvider = providerName;
+  providerConfig.baseUrl = newBaseUrl;
+  providerConfig.apiKey = providerEnv.API_KEY || "";
+  providerConfig.apiFormat = providerEnv.API_FORMAT || "";
+  providerConfig.modelNameOverride = providerEnv.MODEL_NAME || "";
+
+  return { previous, current: { ...providerConfig } };
+}
+
+function handleManagementRequest(req, res) {
+  const url = req.url || "/";
+  const method = req.method || "GET";
+
+  // GET /_proxy/status — return current provider config
+  if (url === "/_proxy/status" && method === "GET") {
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({
+      activeProvider: providerConfig.activeProvider,
+      baseUrl: providerConfig.baseUrl,
+      apiFormat: providerConfig.apiFormat,
+      modelNameOverride: providerConfig.modelNameOverride,
+      hasApiKey: !!providerConfig.apiKey,
+    }));
+    return true;
+  }
+
+  // POST /_proxy/switch — hot-swap provider at runtime
+  if (url === "/_proxy/switch" && method === "POST") {
+    (async () => {
+      try {
+        const chunks = [];
+        for await (const chunk of req) {
+          chunks.push(chunk);
+        }
+        const bodyText = Buffer.concat(chunks).toString("utf8");
+        let parsed;
+        try {
+          parsed = JSON.parse(bodyText);
+        } catch {
+          res.writeHead(400, { "content-type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ error: { message: "invalid JSON body", type: "proxy_error" } }));
+          return;
+        }
+
+        const newProvider = parsed.provider;
+        if (!newProvider || typeof newProvider !== "string") {
+          res.writeHead(400, { "content-type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ error: { message: "missing or invalid 'provider' field", type: "proxy_error" } }));
+          return;
+        }
+
+        const result = switchProvider(newProvider);
+
+        console.log(`[proxy] switched provider: ${result.previous.activeProvider || "(none)"} → ${providerConfig.activeProvider}`);
+        console.log(`[proxy] now proxying to ${providerConfig.baseUrl}`);
+
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({
+          previous: result.previous,
+          current: result.current,
+        }));
+      } catch (error) {
+        const isClientError = error.message.includes("no BASE_URL")
+          || error.message.includes("must not be empty")
+          || error.message.includes("Invalid ACTIVE_PROVIDER");
+        const statusCode = isClientError ? 400 : 500;
+        res.writeHead(statusCode, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: { message: error.message, type: "proxy_error" } }));
+      }
+    })();
+    return true;
+  }
+
+  // Unknown management path
+  if (url.startsWith("/_proxy/")) {
+    res.writeHead(404, { "content-type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ error: { message: "unknown management endpoint", type: "proxy_error" } }));
+    return true;
+  }
+
+  return false;
+}
+
 async function handleRequest(req, res) {
   const chatMode = isChatCompletionsMode();
   let requestUrl = req.url || "/";
@@ -1921,7 +2035,7 @@ async function handleRequest(req, res) {
     requestUrl = originalUrl.replace(/\/v1\/responses$/, "/v1/chat/completions").replace(/\/responses$/, "/chat/completions");
   }
 
-  const upstreamUrl = joinUrl(UPSTREAM_BASE_URL, requestUrl);
+  const upstreamUrl = joinUrl(providerConfig.baseUrl, requestUrl);
   const abortController = new AbortController();
   const onRequestAborted = () => {
     abortController.abort();
@@ -2055,6 +2169,10 @@ async function handleRequest(req, res) {
 }
 
 const server = http.createServer((req, res) => {
+  // Management endpoints (/_proxy/...) are handled first and not proxied
+  if (handleManagementRequest(req, res)) {
+    return;
+  }
   handleRequest(req, res);
 });
 
@@ -2069,11 +2187,11 @@ try {
 
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   console.log(`Listening on ${LOCAL_BASE_URL}`);
-  if (ACTIVE_PROVIDER) {
-    console.log(`Using provider profile ${ACTIVE_PROVIDER}`);
+  if (providerConfig.activeProvider) {
+    console.log(`Using provider profile ${providerConfig.activeProvider}`);
   }
   if (isChatCompletionsMode()) {
     console.log(`API format adaptation: Chat Completions → Responses API`);
   }
-  console.log(`Proxying to ${UPSTREAM_BASE_URL}`);
+  console.log(`Proxying to ${providerConfig.baseUrl}`);
 });

@@ -73,6 +73,41 @@ ACTIVE_PROVIDER=openai
 
 所以命令行里临时传的值优先级最高。
 
+## 运行时热切换 Provider
+
+不用重启代理就能切换上游 provider。代理启动后，发一个 HTTP 请求即可：
+
+```bash
+# 查看当前 provider 状态
+curl http://127.0.0.1:8787/_proxy/status
+
+# 切换到 openai（自动读 .env.openai 里的 BASE_URL / API_KEY / API_FORMAT）
+curl -X POST http://127.0.0.1:8787/_proxy/switch \
+  -H 'Content-Type: application/json' \
+  -d '{"provider":"openai"}'
+
+# 切换到 openrouter
+curl -X POST http://127.0.0.1:8787/_proxy/switch \
+  -H 'Content-Type: application/json' \
+  -d '{"provider":"openrouter"}'
+```
+
+切换后下一个请求立即走新 provider，正在进行的请求不受影响。
+
+`/_proxy/switch` 的行为：
+
+1. 读 `.env.<provider>` 里的 `BASE_URL`、`API_KEY`、`API_FORMAT`、`MODEL_NAME`
+2. 验证 `BASE_URL` 存在，否则返回 400
+3. 更新内存中的配置，不发重启
+4. 返回切换前后的配置对比
+
+管理端点列表：
+
+| 路径 | 方法 | 说明 |
+|------|------|------|
+| `/_proxy/status` | GET | 返回当前 provider 配置（`baseUrl`、`apiFormat`、`activeProvider` 等） |
+| `/_proxy/switch` | POST | 热切换 provider，body: `{"provider":"<name>"}` |
+
 ## 命令行快捷启动
 
 除了手改 `.env`，也可以直接按 provider 启动：
@@ -222,6 +257,9 @@ npm test
 - Tool call 会正确转译（请求和响应双向）
 - 非 `/v1/responses` 路径不受 Chat Completions 模式影响
 - `image_generation` 过滤在 Chat Completions 模式下依然生效
+- `/_proxy/status` 返回当前 provider 配置
+- `/_proxy/switch` 热切换 provider，请求立即走新上游
+- `/_proxy/switch` 对无效 provider 名、缺少 BASE_URL 返回 400
 
 ## mock 压测
 
